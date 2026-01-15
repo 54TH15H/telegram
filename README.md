@@ -77,27 +77,41 @@ Systemd restart support
 🧩 Tech Stack
 ------------------------------------------------------------
 Component	Technology
+
 Language	Python 3.9+
+
 Bot API	python-telegram-bot v20+
+
 Telegram Client	Telethon
+
 Deep Learning	TensorFlow + MobileNetV2
+
 Vector Search	FAISS
+
 Database	SQLite (WAL mode)
+
 Deployment	systemd
 
 📂 Project Structure
 ------------------------------------------------------------
 bot.py                  # Main bot code
+
 config.txt              # Runtime configuration
+
 features.db             # SQLite database
+
 faiss.index             # FAISS index file
+
 README.md
 
 ⚙️ Configuration (config.txt)
 ------------------------------------------------------------
 BOT_TOKEN=YOUR_BOT_TOKEN
+
 TELEGRAM_API_ID=123456
+
 TELEGRAM_API_HASH=abcdef1234567890
+
 STRING_SESSION=YOUR_TELETHON_SESSION
 
 🔐 Access Control
