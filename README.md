@@ -137,28 +137,47 @@ Restart bot service
 👤 User Commands
 ------------------------------------------------------------
 /start            Start the bot
+
 /help             Show help
+
 /groups           View saved groups
+
 /groups <id>      Add groups
+
 /groups -r        Remove groups
+
 /start_scan       Start scanning images
+
 /stop_scan        Stop scan
+
 /status           Scan status
+
 /top <n>          Set top-N results
+
 /chat_id          Get chat ID
+
 /whoami           Show your role
 
 👑 Admin Commands
 ------------------------------------------------------------
 /allow <user_id>        Allow user
+
 /disallow <user_id>     Remove user
+
 /list_allowed           List users
+
 /backup                 Download DB
+
 /import                 Import DB (merge)
+
 /import -f              Import DB (force)
+
 /reset                  Reset DB
+
 /reset_session          Reset Telethon session
+
 /reload_config          Reload config
+
 /restart                Restart bot service
 
 🖼️ How Image Search Works
@@ -206,16 +225,23 @@ Rebuilds FAISS index from scratch
 🛠️ Deployment (systemd example)
 ------------------------------------------------------------
 [Unit]
+
 Description=Telegram Image Search Bot
+
 After=network.target
 
 [Service]
+
 User=ubuntu
+
 WorkingDirectory=/home/ubuntu/bot
+
 ExecStart=/usr/bin/python3 bot.py
+
 Restart=always
 
 [Install]
+
 WantedBy=multi-user.target
 
 🔒 Security Notes
