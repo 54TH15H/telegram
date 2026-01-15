@@ -87,12 +87,11 @@ Deployment	systemd
 
 📂 Project Structure
 ------------------------------------------------------------
-.
-├── bot.py                  # Main bot code
-├── config.txt              # Runtime configuration
-├── features.db             # SQLite database
-├── faiss.index             # FAISS index file
-├── README.md
+bot.py                  # Main bot code
+config.txt              # Runtime configuration
+features.db             # SQLite database
+faiss.index             # FAISS index file
+README.md
 
 ⚙️ Configuration (config.txt)
 ------------------------------------------------------------
