@@ -41,11 +41,10 @@ from tensorflow.keras.preprocessing import image
 
 # ================= NETWORK SAFETY =================
 socket.setdefaulttimeout(30)
+faiss.omp_set_num_threads(2)
 
 FAISS_INDEX_PATH = "faiss.index"
 FAISS_RESET_MARKER = ".faiss_reset_done"
-TRAIN_BUFFER = []
-TRAIN_KEYS = []
 MIN_TRAIN_SIZE = 1000
 
 USER_COMMANDS = [
@@ -70,6 +69,8 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand("reset_session", "Reset Telegram Session"),
     BotCommand("reload_config", "Reload config"),
     BotCommand("restart", "Restart bot"),
+    BotCommand("rebuild_index", "Rebuild index"),
+    BotCommand("stats", "Show system statistics"),
 ]
 
 USER_HELP_TEXT = (
@@ -81,10 +82,11 @@ USER_HELP_TEXT = (
     "/start_scan — Scan images from groups\n"
     "/stop_scan — Stop running scan\n"
     "/status — Show scan status\n"
-    "/top — Show or set top N results\n"
+    "/top — Show top N results\n"
+    "/top &lt;n&gt;— Set top N results\n"
     "/whoami — Show your access role\n"
     "/chat_id — Get current chat ID\n"
-    "/help — Show this help\n"
+    "/help — Show all commands\n"
 )
 
 ADMIN_HELP_TEXT = (
@@ -100,18 +102,22 @@ ADMIN_HELP_TEXT = (
     "/reset_session — Reset Telegram session\n"
     "/reload_config — Reload configuration\n"
     "/restart — Restart bot\n"
+    "/rebuild_index — Rebuild index\n"
+    "/stats — Show system statistics\n"
 )
 
 
 ACCESS_DENIED_MSG = "⛔ You are not authorized to use this bot!\nPlease contact administrator (sathishsathi7780@gmail.com)."
 
 # ================= ADMINS =================
-ADMIN_USER = 0000000000
+ADMIN_USER = 000000000
 allowed_users_cache = set()
 
-import asyncio
-from telethon import TelegramClient
-from telethon.sessions import StringSession
+# 🧹 Cleanup stale FAISS temp file (from crash)
+tmp = FAISS_INDEX_PATH + ".tmp"
+if os.path.exists(tmp):
+    print("🧹 Removing stale FAISS tmp file")
+    os.remove(tmp)
 
 def generate_new_string_session(api_id, api_hash):
     # ✅ Create and bind event loop for this thread
@@ -146,6 +152,43 @@ def update_string_session_in_config(new_session, path="config.txt"):
 
     with open(path, "w") as f:
         f.writelines(lines)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await safe_reply(update, ACCESS_DENIED_MSG)
+        return
+
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM image_features")
+    total = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM image_features WHERE active=1")
+    active = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM image_features WHERE active=0")
+    inactive = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM image_refs")
+    refs = cur.fetchone()[0]
+
+    rebuild_status = "⚠️ REQUIRED" if needs_rebuild else "✅ Healthy"
+
+    text = (
+        "📊 *System Stats*\n\n"
+        f"🗂️ Total images: {total}\n"
+        f"✅ Active images: {active}\n"
+        f"❌ Inactive images: {inactive}\n"
+        f"🔗 Total references: {refs}\n"
+        f"🧠 FAISS vectors (incl inactive): {index.ntotal}\n"
+        f"♻️ Index rebuild: {rebuild_status}\n"
+    )
+
+    await update.message.reply_text(
+        escape_markdown(text, version=2),
+        parse_mode=ParseMode.MARKDOWN_V2
+    )
+
 
 async def reset_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -339,12 +382,17 @@ VECTOR_DIM = 1280
 MAX_DB_SIZE = 500 * 1024 * 1024
 
 # ================= GLOBAL STATE =================
+index = None
 load_cancel_flags = {}   # user_id -> bool
 scan_status = {}         # user_id -> dict
 user_top_n = {}
 scan_tasks = {}   # user_id -> asyncio.Task
 scan_progress_msg = {}  # user_id -> Message
 faiss_lock = asyncio.Lock()
+
+# ================= REBUILD STATE =================
+needs_rebuild = False
+rebuild_event = asyncio.Event()
 
 # ================= MODEL =================
 model = MobileNetV2(weights="imagenet", include_top=False, pooling="avg")
@@ -366,7 +414,6 @@ CREATE TABLE IF NOT EXISTS allowed_users (
 conn.commit()
 
 cur.execute("INSERT OR IGNORE INTO allowed_users VALUES (?)", (ADMIN_USER,))
-
 conn.commit()
 
 load_allowed_users()
@@ -375,8 +422,14 @@ load_allowed_users()
 cur.execute("""
 CREATE TABLE IF NOT EXISTS image_features (
     image_key TEXT PRIMARY KEY,
-    vector BLOB
+    vector BLOB,
+    active INTEGER DEFAULT 1
 )
+""")
+
+cur.execute("""
+CREATE INDEX IF NOT EXISTS idx_image_active
+ON image_features(active)
 """)
 
 # cur.execute("DROP TABLE IF EXISTS image_refs")
@@ -389,6 +442,12 @@ CREATE TABLE IF NOT EXISTS image_refs (
     PRIMARY KEY (image_key, chat_id, msg_id)
 )
 """)
+
+cur.execute("""
+CREATE INDEX IF NOT EXISTS idx_image_refs_key
+ON image_refs(image_key)
+""")
+
 
 # cur.execute("DROP TABLE IF EXISTS user_groups")
 cur.execute("""
@@ -430,6 +489,75 @@ def get_image_links(image_key):
         (image_key,)
     )
     return cur.fetchall()
+
+async def get_image_links_live(image_key, client):
+    global needs_rebuild
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT chat_id, msg_id, chat_title
+        FROM image_refs
+        WHERE image_key=?
+        """,
+        (image_key,)
+    )
+
+    rows = cur.fetchall()
+    valid_links = []
+
+    dirty = False
+    for chat_id, msg_id, title in rows:
+        try:
+            msg = await client.get_messages(int(chat_id), ids=msg_id)
+            if msg:
+                valid_links.append((chat_id, msg_id, title))
+            else:
+                raise Exception("Deleted")
+
+        except Exception:
+            # ❌ Message deleted → remove ref only
+            cur.execute(
+                """
+                DELETE FROM image_refs
+                WHERE image_key=? AND chat_id=? AND msg_id=?
+                """,
+                (image_key, chat_id, msg_id)
+            )
+            dirty = True
+    if dirty:
+        conn.commit()
+
+    # 🔍 If no refs remain → mark inactive
+    cur.execute(
+        "SELECT COUNT(*) FROM image_refs WHERE image_key=?",
+        (image_key,)
+    )
+    remaining = cur.fetchone()[0]
+
+    if remaining == 0:
+        cur.execute(
+            """
+            UPDATE image_features
+            SET active = 0
+            WHERE image_key=?
+            """,
+            (image_key,)
+        )
+        conn.commit()
+        needs_rebuild = True
+        rebuild_event.set()
+
+    cur.execute("SELECT COUNT(*) FROM image_features WHERE active=0")
+    inactive = cur.fetchone()[0]
+
+    if inactive > max(500, index.ntotal // 3):
+        if not needs_rebuild:
+            print("⚠️ FAISS marked for rebuild (too many inactive vectors)")
+            needs_rebuild = True
+            rebuild_event.set()
+
+    return valid_links
+
 
 def reload_config():
     global cfg, BOT_TOKEN, API_ID, API_HASH, STRING_SESSION
@@ -496,11 +624,19 @@ async def set_top_n(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def load_vectors():
+    global index
     cur = conn.cursor()
-    cur.execute("SELECT image_key, vector FROM image_features")
+    cur.execute(
+        "SELECT image_key, vector FROM image_features WHERE active = 1"
+    )
+
     rows = cur.fetchall()
 
     if not rows:
+        return
+
+    if len(rows) < 2:
+        print("⚠️ Not enough vectors to train FAISS index")
         return
 
     vectors = []
@@ -516,26 +652,25 @@ async def load_vectors():
 
     MAX_TRAIN = 50000
 
-    async with faiss_lock:
-        index.reset()
-        image_keys.clear()
-        if not index.is_trained:
-            if len(arr) > MAX_TRAIN:
-                sample = arr[np.random.choice(len(arr), MAX_TRAIN, replace=False)]
-            else:
-                sample = arr
-
-            trained = safe_train_ivf(sample)
-
-            if trained:
-                index.add(arr)
-                image_keys.extend(keys)
-            else:
-                print("⚠️ Not enough vectors to train IVF on load")
-                return
+    index.reset()
+    image_keys.clear()
+    if not index.is_trained:
+        if len(arr) > MAX_TRAIN:
+            sample = arr[np.random.choice(len(arr), MAX_TRAIN, replace=False)]
         else:
+            sample = arr
+
+        trained = safe_train_ivf(sample)
+
+        if trained:
             index.add(arr)
             image_keys.extend(keys)
+        else:
+            print("⚠️ Not enough vectors to train IVF on load")
+            return
+    else:
+        index.add(arr)
+        image_keys.extend(keys)
 
 
 # ================= HELPERS =================
@@ -573,7 +708,6 @@ def update_last_msg_id(chat_id, msg_id):
         (str(chat_id), msg_id),
     )
 
-
 def extract_features(img_path):
     img = image.load_img(img_path, target_size=(224, 224))
     x = image.img_to_array(img)
@@ -588,15 +722,34 @@ def extract_features(img_path):
 async def search_similar(img_path, top_n):
     vec = extract_features(img_path)
     async with faiss_lock:
-        D, I = index.search(vec.reshape(1, -1), top_n)
+        # search more to compensate inactive skips
+        k = min(index.ntotal, max(top_n * 5, 50))
+        D, I = index.search(vec.reshape(1, -1), k)
         keys_snapshot = list(image_keys)
 
     results = []
+    cur = conn.cursor()
+    seen = set()
+
     for score, idx in zip(D[0], I[0]):
-        score = float(score)
-        if not (0.0 <= score <= 1.0):
-            continue  # skip invalid results
-        results.append((keys_snapshot[idx], score))
+        if idx < 0 or idx >= len(keys_snapshot):
+            continue
+
+        image_key = keys_snapshot[idx]
+        if image_key in seen:
+            continue
+        seen.add(image_key)
+
+        cur.execute(
+            "SELECT active FROM image_features WHERE image_key=?",
+            (image_key,)
+        )
+        row = cur.fetchone()
+
+        if not row or row[0] == 0:
+            continue  # ❌ skip inactive
+
+        results.append((image_key, float(score)))
 
     return results
 
@@ -809,9 +962,51 @@ async def get_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN_V2
     )
 
+async def rebuild_index(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await safe_reply(update, ACCESS_DENIED_MSG)
+        return
+
+    if any(s.get("running") for s in scan_status.values()):
+        await safe_reply(
+            update,
+            "♻️ Rebuilding cancelled! Some background processes are still running"
+        )
+        return
+
+    await safe_reply(
+        update,
+        "♻️ Rebuilding FAISS index...\n"
+        "⏳ Searches will be temporarily paused."
+    )
+
+    global needs_rebuild
+
+    start = time.time()
+
+    try:
+        async with faiss_lock:   # ✅ REQUIRED
+            await load_vectors()
+
+            tmp_index = FAISS_INDEX_PATH + ".tmp"
+            faiss.write_index(index, tmp_index)
+            os.replace(tmp_index, FAISS_INDEX_PATH)
+
+            if os.path.exists(tmp_index):
+                os.remove(tmp_index)
+
+        print(f"♻️ FAISS rebuilt in {time.time() - start:.2f}s")
+        needs_rebuild = False
+        rebuild_event.clear()
+        await safe_reply(update, "✅ FAISS index rebuilt successfully")
+
+    except Exception as e:
+        await safe_reply(update, f"❌ Rebuild failed:\n{e}")
+
+
 async def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    global STRING_SESSION
+    global STRING_SESSION, index, needs_rebuild
 
     if not is_allowed_user(update):
         await safe_reply(update, ACCESS_DENIED_MSG)
@@ -853,16 +1048,19 @@ async def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         async with client:
             for group in groups:
+                last_seen_msg_id = None
                 chat_id = str(group)
                 if not chat_id.startswith("-"):
                     continue
 
                 try:
+                    last_id = get_last_msg_id(chat_id) or 0
                     async for msg in client.iter_messages(
-                        int(chat_id),
-                        filter=InputMessagesFilterPhotos,
-                        reverse=True,
-                        limit=limit or 10_000
+                            int(chat_id),
+                            filter=InputMessagesFilterPhotos,
+                            reverse=True,
+                            min_id=last_id,
+                            limit=limit or 10_000
                     ):
                         # 🛑 Cancel support
                         if load_cancel_flags.get(uid):
@@ -880,6 +1078,8 @@ async def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                         if not msg.photo:
                             continue
+
+                        last_seen_msg_id = msg.id
 
                         # 🔑 Stable image key (Telethon-safe)
                         photo = msg.photo
@@ -902,14 +1102,13 @@ async def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                         )
 
-                        # 🔍 Check if vector already exists
                         cur.execute(
-                            "SELECT 1 FROM image_features WHERE image_key=?",
+                            "SELECT active, vector FROM image_features WHERE image_key=?",
                             (image_key,)
                         )
-                        image_exists = cur.fetchone()
+                        row = cur.fetchone()
 
-                        if not image_exists:
+                        if row is None:
                             # ⬇️ Download & extract ONLY once per unique image
                             fd, tmp = tempfile.mkstemp(suffix=".jpg")
                             os.close(fd)
@@ -919,38 +1118,38 @@ async def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 vec = await asyncio.to_thread(extract_features, tmp)
 
                                 cur.execute(
-                                    "INSERT INTO image_features VALUES (?, ?)",
-                                    (image_key, vec.tobytes())
+                                    "INSERT INTO image_features VALUES (?, ?, ?)",
+                                    (image_key, vec.tobytes(), 1)
                                 )
 
-                                async with faiss_lock:
-                                    if not index.is_trained:
-                                        TRAIN_BUFFER.append(vec)
-                                        TRAIN_KEYS.append(image_key)
-
-                                        if len(TRAIN_BUFFER) >= MIN_TRAIN_SIZE:
-                                            arr = np.vstack(TRAIN_BUFFER)
-                                            if safe_train_ivf(arr):
-                                                index.add(arr)
-                                                image_keys.extend(TRAIN_KEYS)
-                                            TRAIN_BUFFER.clear()
-                                            TRAIN_KEYS.clear()
-                                    else:
-                                        index.add(vec.reshape(1, -1))
-                                        image_keys.append(image_key)
-
+                                needs_rebuild = True
+                                rebuild_event.set()
                                 added += 1
                                 scan_status[uid]["added"] = added
 
                             finally:
                                 await safe_delete(tmp)
+
+                        elif row[0] == 0:
+                            cur.execute(
+                                "UPDATE image_features SET active = 1 WHERE image_key=?",
+                                (image_key,)
+                            )
+
+                            conn.commit()
+                            needs_rebuild = True
+                            rebuild_event.set()
+                            added += 1
+
                         else:
+                            # 🔁 Already active image
                             skipped += 1
                             scan_status[uid]["skipped"] = skipped
 
                         await asyncio.sleep(0)
 
-                        if processed % 100 == 0:
+                        if processed % 50 == 0:
+                            update_last_msg_id(chat_id, msg.id)
                             conn.commit()
 
                         # 📊 Progress update
@@ -966,26 +1165,19 @@ async def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             )
                             last_update = time.time()
 
+                    if last_seen_msg_id is not None:
+                        update_last_msg_id(chat_id, last_seen_msg_id)
+                        conn.commit()
+
                 except FloodWaitError as e:
                     print(f"⏳ FloodWait: sleeping {e.seconds}s")
                     await asyncio.sleep(e.seconds)
 
                 except Exception as e:
-                    print("Exception caught (660): ",e)
+                    print(f"[scan-warning] {type(e).__name__}")
+                    await asyncio.sleep(2) # small cooldown
 
             conn.commit()
-
-        # 🔚 Final FAISS flush
-        async with faiss_lock:
-            if not index.is_trained and TRAIN_BUFFER:
-                arr = np.vstack(TRAIN_BUFFER)
-                if safe_train_ivf(arr):
-                    index.add(arr)
-                    image_keys.extend(TRAIN_KEYS)
-                TRAIN_BUFFER.clear()
-                TRAIN_KEYS.clear()
-
-            faiss.write_index(index, FAISS_INDEX_PATH)
 
         scan_status[uid]["running"] = False
         await progress.edit_text(
@@ -1007,6 +1199,8 @@ async def run_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         scan_progress_msg.pop(uid, None)
         load_cancel_flags.pop(uid, None)
 
+        if needs_rebuild:
+            print("♻️ DB updated, FAISS rebuild pending")
 
 # ================= LOAD / CANCEL =================
 async def start_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1076,10 +1270,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # DB count
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM image_features")
+    cur.execute("SELECT COUNT(*) FROM image_features WHERE active = 1")
     db_count = cur.fetchone()[0]
 
     text = "📊 *Status*\n\n"
+
+    if db_count < 2:
+        text += "\n⚠️ Not enough images to train search index"
+
     text += f"🗂️ Images in DB: {db_count}\n\n"
     # text += f"🧠 Images in FAISS index: {index.ntotal}\n\n"
 
@@ -1175,10 +1373,62 @@ async def reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await q.edit_message_text("✅ Reset completed successfully.")
 
+async def rebuild_watcher():
+    global needs_rebuild
+    while True:
+        await rebuild_event.wait()
+        await asyncio.sleep(10)   # debounce
+        rebuild_event.clear()
+
+        if not needs_rebuild:
+            continue
+
+        if any(s.get("running") for s in scan_status.values()):
+            rebuild_event.set()
+            continue
+
+        print("🛠️ Background FAISS rebuild started")
+
+        try:
+            async with faiss_lock:
+                await load_vectors()
+
+                if index.ntotal < 2:
+                    print("⚠️ Rebuild skipped: not enough vectors")
+                    needs_rebuild = False
+                    continue
+
+                tmp_index = FAISS_INDEX_PATH + ".tmp"
+                faiss.write_index(index, tmp_index)
+                os.replace(tmp_index, FAISS_INDEX_PATH)
+
+                if os.path.exists(tmp_index):
+                    os.remove(tmp_index)
+
+            needs_rebuild = False
+            print("✅ Background FAISS rebuild completed")
+
+        except Exception as e:
+            print("❌ Background rebuild failed:", e)
+            rebuild_event.set()
+
 # ================= SEARCH =================
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed_user(update):
         await safe_reply(update, ACCESS_DENIED_MSG)
+        return
+
+    global index
+    if index is None or not index.is_trained:
+        await safe_reply(update, "⚠️ Search index not ready. Please try again.")
+        return
+
+    if needs_rebuild:
+        await safe_reply(
+            update,
+            "⚠️ Search index is updating.\n"
+            "Please wait a few minutes or ask admin to run /rebuild_index."
+        )
         return
 
     await safe_reply(update, "✅ Image received. Finding similar images...")
@@ -1201,20 +1451,49 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "🔍 *Top Matches*\n\n"
 
-    for image_key, score in results:
-        percent = escape_markdown(f"{score * 100:.2f}", version=2)
-        text += f"📸 Similarity: {percent}%\n"
+    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-        links = get_image_links(image_key)
-        for chat_id, msg_id, title in links:
-            safe_title = escape_markdown(title or "My Group", version=2)
-            link = escape_markdown(
-                build_message_link(chat_id, msg_id),
-                version=2
-            )
-            text += f"• {safe_title}\n  🔗 {link}\n"
+    async with client:
+        # for image_key, score in results:
+        #     percent = escape_markdown(f"{score * 100:.2f}", version=2)
+        #     text += f"📸 Similarity: {percent}%\n"
+        #
+        #     links = await get_image_links_live(image_key, client)
+        #
+        #     for chat_id, msg_id, title in links:
+        #         safe_title = escape_markdown(title or "My Group", version=2)
+        #         link = escape_markdown(
+        #             build_message_link(chat_id, msg_id),
+        #             version=2
+        #         )
+        #         text += f"• {safe_title}\n  🔗 {link}\n"
+        #
+        #     text += "\n"
 
-        text += "\n"
+        shown = 0
+        for image_key, score in results:
+            if shown >= top_n:
+                break
+
+            links = await get_image_links_live(image_key, client)
+
+            # ❌ Skip images with no remaining references
+            if not links:
+                continue
+
+            percent = escape_markdown(f"{score * 100:.2f}", version=2)
+            text += f"📸 Similarity: {percent}%\n"
+
+            for chat_id, msg_id, title in links:
+                safe_title = escape_markdown(title or "My Group", version=2)
+                link = escape_markdown(
+                    build_message_link(chat_id, msg_id),
+                    version=2
+                )
+                text += f"• {safe_title}\n  🔗 {link}\n"
+
+            text += "\n"
+            shown += 1
 
     await update.message.reply_text(
         text,
@@ -1246,7 +1525,7 @@ async def import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def count_rows_in_db(db_path):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM image_features")
+    cur.execute("SELECT COUNT(*) FROM image_features WHERE active = 1")
     total = cur.fetchone()[0]
     conn.close()
     return total
@@ -1311,7 +1590,7 @@ async def handle_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     doc = update.message.document
-
+    global needs_rebuild
     if doc.file_size > MAX_DB_SIZE:
         await safe_reply(update, "❌ File too large")
         return
@@ -1361,6 +1640,7 @@ async def handle_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # 1️⃣ Clear existing data safely
             cur = conn.cursor()
             cur.execute("DELETE FROM image_features")
+            cur.execute("DELETE FROM image_refs")
             cur.execute("DELETE FROM group_progress")
             conn.commit()
 
@@ -1380,15 +1660,12 @@ async def handle_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 processed += 1
 
                 cur.execute(
-                    "INSERT INTO image_features VALUES (?, ?)",
-                    (image_key, vector_blob)
+                    "INSERT INTO image_features VALUES (?, ?, ?)",
+                    (image_key, vector_blob, 1)
                 )
 
-                vec = np.frombuffer(vector_blob, dtype=np.float32)
-                faiss.normalize_L2(vec.reshape(1, -1))
-                async with faiss_lock:
-                    index.add(vec.reshape(1, -1))
-                    image_keys.append(image_key)
+                needs_rebuild = True
+                rebuild_event.set()
 
                 if time.time() - last_update >= 3:
                     percent = int((processed / total_rows) * 100)
@@ -1406,9 +1683,6 @@ async def handle_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "✅ Import completed (FULL REPLACE)\n"
                 f"📦 Total images: {index.ntotal}"
             )
-
-            async with faiss_lock:
-                faiss.write_index(index, FAISS_INDEX_PATH)
 
             return
 
@@ -1436,18 +1710,14 @@ async def handle_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 skipped += 1
                 continue
 
-            vec = np.frombuffer(vector_blob, dtype=np.float32)
-
             cur.execute(
-                "INSERT INTO image_features VALUES (?, ?)",
-                (image_key, vector_blob)
+                "INSERT INTO image_features VALUES (?, ?, ?)",
+                (image_key, vector_blob, 1)
             )
             conn.commit()
 
-            faiss.normalize_L2(vec.reshape(1, -1))
-            async with faiss_lock:
-                index.add(vec.reshape(1, -1))
-                image_keys.append(image_key)
+            needs_rebuild = True
+            rebuild_event.set()
             added += 1
 
             # 🔁 Update progress every 3 seconds
@@ -1473,10 +1743,6 @@ async def handle_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"📦 Total images: {index.ntotal}"
         )
 
-        async with faiss_lock:
-            faiss.write_index(index, FAISS_INDEX_PATH)
-
-
     except Exception as e:
         await progress_msg.edit_text(f"❌ Import failed:\n{e}")
 
@@ -1484,6 +1750,10 @@ async def handle_import_file(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop("import_force", None)
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+        needs_rebuild = True
+        rebuild_event.set()
+
 
 # ================= ERROR HANDLER =================
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1593,8 +1863,11 @@ async def setup_commands(application):
     )
 
     global index
-    cur.execute("SELECT COUNT(*) FROM image_features")
+    cur.execute("SELECT COUNT(*) FROM image_features WHERE active = 1")
     vector_count = cur.fetchone()[0]
+
+    if vector_count < 2:
+        print("⚠️ Not enough images to train FAISS index")
 
     expected_nlist = compute_nlist(vector_count)
 
@@ -1613,11 +1886,16 @@ async def setup_commands(application):
             print("⚠️ FAISS incompatible, rebuilding from DB:", e)
             os.remove(FAISS_INDEX_PATH)
             index = create_faiss_index(vector_count)
-            await load_vectors()
+            async with faiss_lock:
+                await load_vectors()
+
     else:
         # 🔥 THIS WAS MISSING
         index = create_faiss_index(vector_count)
-        await load_vectors()
+        async with faiss_lock:
+            await load_vectors()
+
+    application.create_task(rebuild_watcher())
 
 
 # ================= MAIN =================
@@ -1657,6 +1935,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("list_allowed", list_allowed))
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("restart", restart_command))
+    app.add_handler(CommandHandler("rebuild_index", rebuild_index))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CallbackQueryHandler(reset_callback, pattern="^reset_"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_import_file))
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))

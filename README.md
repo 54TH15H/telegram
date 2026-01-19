@@ -180,6 +180,10 @@ Restart bot service
 
 /restart                Restart bot service
 
+/stats                  Show system statistics
+
+/rebuild_index          Rebuild index
+
 🖼️ How Image Search Works
 ------------------------------------------------------------
 Images are downloaded from Telegram groups
