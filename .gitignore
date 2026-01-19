@@ -1,0 +1,15 @@
+.idea
+group_images
+venv/
+env/
+*.venv/
+telegram-img-bot-env
+config*.txt
+!config.sample.txt
+*.db
+*.db-shm
+*.db-wal
+*.index
+session*.py
+session*.session
+session*.json
